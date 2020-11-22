@@ -78,6 +78,7 @@ def create_graph(data, grid, north_min, east_min, safety_distance):
     east_size = grid.shape[1]
     
     # TODO: check each edge from graph.ridge_vertices for collision
+    sd = 2
     edges = []
     for v in graph.ridge_vertices:
         p1 = graph.vertices[v[0]]
@@ -102,7 +103,7 @@ def create_graph(data, grid, north_min, east_min, safety_distance):
                  break
             
             # grid[n, e] is the altitude
-            if grid[n, e] > safety_distance:
+            if (grid[n-sd:n+sd, e-sd:e+sd] > safety_distance).any():
                  in_collision = True
                  break
                      
@@ -240,7 +241,7 @@ def grid_a_star(grid, h, start, goal, safety_distance):
 def heuristic(position, goal_position):
     return np.linalg.norm(np.array(position) - np.array(goal_position))
 
-def graph_a_star(nxGraph, h, start, goal):
+def graph_a_star(nxGraph, h, start, goal, failIfPathNotFound=False):
     path = []
     path_cost = 0
     queue = PriorityQueue()
@@ -252,12 +253,18 @@ def graph_a_star(nxGraph, h, start, goal):
 
     # disjointed edges, find node nearest to goal that has a path to start
     foundPath2Goal = nx.has_path(nxGraph,start,goal)
+    if (not foundPath2Goal) and failIfPathNotFound:
+        print('**********************')
+        print('Failed to find a path!')
+        print('**********************') 
+        return foundPath2Goal, None, path_cost
+
     listNodes = list(nxGraph)
     if not foundPath2Goal:
         closestNodesIndices = np.argsort(np.linalg.norm(goal - np.array(listNodes), axis=1))
         for idx in closestNodesIndices:
             node = listNodes[idx]
-            if (goal == node):
+            if (start == node or goal == node):
                 continue
                 
             if nx.has_path(nxGraph,start,node):
@@ -405,13 +412,13 @@ def Bresenham3D(x1, y1, z1, x2, y2, z2):
 def can_connect_3d(grid, p1, p2, safety_distance):
     bList = Bresenham3D(int(p1[0]), int(p1[1]), int(p1[2]), 
                         int(p2[0]), int(p2[1]), int(p2[2]))
+    sd = 2
     in_collision = False
     for pt in bList:
         n = int(pt[0])
         e = int(pt[1])
         a = int(pt[2])
         
-        sd = 2*safety_distance
         # grid[n, e] is the altitude
         if (grid[n-sd:n+sd, e-sd:e+sd] + safety_distance > a).any():
             in_collision = True
@@ -419,7 +426,18 @@ def can_connect_3d(grid, p1, p2, safety_distance):
                      
     return not in_collision        
 
-def prune_path(path, grid, safety_distance):
+def prune_path_collinearity(path):
+    idx = 0
+    while idx < len(path)-2:
+        if are_collinear(path[idx], path[idx+1], path[idx+2]):
+            path.pop(idx+1)
+            continue
+        
+        idx += 1
+
+    return path
+
+def prune_path_bresenham(path, grid, safety_distance):
     idx = 0
     while idx < len(path)-2:
         if can_connect_3d(grid, path[idx], path[idx+2], safety_distance):
@@ -431,29 +449,35 @@ def prune_path(path, grid, safety_distance):
     return path
 
 def createProbabilisticRoadMap(grid, grid_start, grid_goal, safety_distance):
-    amin = grid_start[2] + safety_distance
-
     nmin = grid_start[0] if grid_start[0] < grid_goal[0] else grid_goal[0]
     nmax = grid_start[0] if grid_start[0] > grid_goal[0] else grid_goal[0]
     emin = grid_start[1] if grid_start[1] < grid_goal[1] else grid_goal[1]
-    emax = grid_start[1] if grid_start[1] < grid_goal[1] else grid_goal[1]
+    emax = grid_start[1] if grid_start[1] > grid_goal[1] else grid_goal[1]
 
+    amin = grid_start[2] + safety_distance
     amax = grid[nmin-safety_distance:nmax+safety_distance, 
                 emin-safety_distance:emax+safety_distance].max() + 2*safety_distance
 
-    # we are only tackling situation where start and goal are on opposite sides of a barrier
+    # we are tackling situation where start and goal are on opposite sides of a barrier
     # only reachable by going over the top or through some opening
-    num_of_samples = 10
-    asamples = np.linspace(amin, amax, num_of_samples).astype(int)
+    num_of_samples = 300
 
-    nsamples = np.ones(num_of_samples)*grid_start[0]
-    esamples = np.ones(num_of_samples)*grid_start[1]
-    # Use zip to turn them into point tuples and throw out ones that are inside an obstruction
-    samplePoints = list(zip(nsamples.astype(int), esamples.astype(int), asamples))
+    nsamples = np.random.random_integers(nmin, nmax, num_of_samples)
+    esamples = np.random.random_integers(emin, emax, num_of_samples)
+    asamples = np.random.random_integers(amin, amax, num_of_samples)
+    samplePoints = list(zip(nsamples, esamples, asamples))
 
-    nsamples = np.ones(num_of_samples)*grid_goal[0]
-    esamples = np.ones(num_of_samples)*grid_goal[1]
-    samplePoints += list(zip(nsamples.astype(int), esamples.astype(int), asamples))
+    # throw out ones that are inside or too close to an obstruction
+    sd = 2
+    idx = 0
+    while idx < len(samplePoints):
+        n = samplePoints[idx][0]
+        e = samplePoints[idx][1]
+        a = samplePoints[idx][2]
+        if (grid[n-sd:n+sd, e-sd:e+sd] + safety_distance > a).any():
+            samplePoints.pop(idx)
+            continue
+        idx += 1
 
     # add the grid start and goal to the list of sample points
     samplePoints.append(grid_start)
@@ -468,81 +492,19 @@ def createProbabilisticRoadMap(grid, grid_start, grid_goal, safety_distance):
             if samplePt == samplePoints[i]:
                 continue
             
-            # tight spot. Reduce safety_distance by half
-            if can_connect_3d(grid, samplePt, samplePoints[i], int(safety_distance/2)):
+            if can_connect_3d(grid, samplePt, samplePoints[i], safety_distance):
                 dist = np.linalg.norm(np.array(samplePt) - np.array(samplePoints[i]))
                 g.add_edge(samplePt, samplePoints[i], weight=dist)
 
     if g.number_of_nodes() == 0:
         return False, None
 
-    foundPath2Goal, path, _ = graph_a_star(g, heuristic, grid_start, grid_goal)
+    foundPath2Goal, path, _ = graph_a_star(g, heuristic, grid_start, grid_goal, True)
 
-    # don't return grid start and grid_goal. 
-    # grid_start is already in the path. We will be adding grid_goal later
-    return foundPath2Goal, path[1:-1]   
+    if foundPath2Goal:
+        # don't return grid start and grid_goal. 
+        # grid_start is already in the path. We will be adding grid_goal later
+        return foundPath2Goal, path[1:-1]
+    else:
+        return foundPath2Goal, None
 
-
-def get_receding_horizon_target(grid, north_offset, east_offset, 
-                                local_position, target_position, dist2Target, safety_distance):
-    receding_horizon_cube_half_size = 20    # 40 x 40 cube
-    if receding_horizon_cube_half_size > dist2Target:
-        receding_horizon_cube_half_size = np.int(dist2Target)
-
-    # construct a cube around the local position and sample points in this cube
-    grid_localPos = local_position_2_grid_coord(local_position, grid, north_offset, east_offset)
-    local_alt = -local_position[2]     # convert from negative down to positive alt
-
-    nmin = np.max(grid_localPos[0] - receding_horizon_cube_half_size, initial=0)
-    nmax = np.min(grid_localPos[0] + receding_horizon_cube_half_size, initial=grid.shape[0]-1)
-
-    emin = np.max(grid_localPos[1] - receding_horizon_cube_half_size, initial=0)
-    emax = np.min(grid_localPos[1] + receding_horizon_cube_half_size, initial=grid.shape[1]-1)
-
-    amin = np.max(local_alt - receding_horizon_cube_half_size, initial=0)
-    amax = local_alt + receding_horizon_cube_half_size
-
-    num_of_samples = 50
-    nsamples = np.random.randint(nmin, nmax, num_of_samples)
-    esamples = np.random.randint(emin, emax, num_of_samples)
-    asamples = np.random.randint(amin, amax, num_of_samples)
-
-    # Use zip to turn them into point tuples and throw out ones that are inside an obstruction
-    navigableSamplePoints = []
-    samplePoints = list(zip(nsamples, esamples, asamples))
-    for samplePt in samplePoints:
-        if grid[samplePt[0], samplePt[1]] + safety_distance <= samplePt[2]:
-            navigableSamplePoints.append(samplePt)
-
-    # construct a navigable graph using the navigable sample points
-    g = nx.Graph()   
-    tree = KDTree(navigableSamplePoints)
-    for samplePt in navigableSamplePoints:
-        idxs = tree.query([samplePt], k=15, return_distance=False)[0]
-        for i in idxs:
-            if samplePt == navigableSamplePoints[i]:
-                continue
-                
-            if can_connect_3d(grid, samplePt, navigableSamplePoints[i], safety_distance):
-                dist = np.linalg.norm(np.array(samplePt) - np.array(navigableSamplePoints[i]))
-                g.add_edge(samplePt, navigableSamplePoints[i], weight=dist)
-
-    # construct the probabilistic roadmap from the navigable graph
-    grid_targetPos = local_position_2_grid_coord(target_position, grid, north_offset, east_offset)
-        
-    grid_localPos_3d = (grid_localPos[0], grid_localPos[1], local_alt)
-    grid_targetPos_3d = (grid_targetPos[0], grid_targetPos[1], target_position[2])
-
-    graph_start_3d = closestNode(g, grid_localPos_3d)
-    graph_goal_3d = closestNode(g, grid_targetPos_3d)
-    path, _ = graph_a_star(g, heuristic, graph_start_3d, graph_goal_3d)
-
-    # first waypoint is basically the closest node to localPos
-    # So, set receding horizon target to second waypoint on this roadmap
-    grid_receding_horizon_target = path[1]
-
-    # convert target from grid to local coordinates
-    local_receding_horizon_target_2d = grid_coord_2_local_position(grid_receding_horizon_target, 
-                                                                    north_offset, east_offset)
-    return (local_receding_horizon_target_2d[0], local_receding_horizon_target_2d[1],
-            grid_receding_horizon_target[2])

@@ -5,10 +5,11 @@ from enum import Enum, auto
 
 import numpy as np
 
-from planning_utils import grid_a_star, heuristic, create_grid, prune_path
+from planning_utils import grid_a_star, heuristic, create_grid
+from planning_utils import prune_path_bresenham, prune_path_collinearity
 from planning_utils import local_position_2_grid_coord, grid_coord_2_local_position
 from planning_utils import graph_a_star, create_graph, closestNode
-from planning_utils import get_receding_horizon_target, createProbabilisticRoadMap
+from planning_utils import createProbabilisticRoadMap
 
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
@@ -52,8 +53,11 @@ class MotionPlanning(Drone):
         self.north_offset = -1
         self.east_offset = -1
 
-        self.SAFETY_DISTANCE = 5
+        self.SAFETY_DISTANCE = 3
         self.landing_alt = 0
+        self.prevTargetPos = 0
+
+        self.deadband_multiplier = 1.0
 
     def local_position_callback(self):
         if self.flight_state == States.TAKEOFF:
@@ -62,14 +66,18 @@ class MotionPlanning(Drone):
         elif self.flight_state == States.WAYPOINT:
             localPos = np.array([self.local_position[0], self.local_position[1], -self.local_position[2]])
             dist2Target = np.linalg.norm(self.target_position - localPos)
+            droneSpeed = np.linalg.norm(self.local_velocity[0:2])
             if len(self.waypoints) > 0:
-                if dist2Target < self.SAFETY_DISTANCE:   # deadband safety distance
+                if dist2Target < self.SAFETY_DISTANCE + droneSpeed*self.deadband_multiplier:   # deadbanding
                     self.waypoint_transition()
-                #else:
-                #    self.navigate_to_target(dist2Target)
+                #elif np.linalg.norm(self.prevTargetPos - localPos) > self.SAFETY_DISTANCE and \
+                #    np.linalg.norm(self.local_velocity) < 0.03:  # unforeseen obstruction. replan!
+                #        replanSucceeded = self.replan(self.prevTargetPos, self.waypoints[-1])
+                #        if replanSucceeded:
+                #            self.waypoint_transition()
             else:
                 if dist2Target < 1.0:   # deadband of 1 meter at the goal
-                    if np.linalg.norm(self.local_velocity[0:2]) < 1.0:
+                    if droneSpeed < 1.0:
                         self.landing_transition()
                 #else:
                 #    self.navigate_to_target()
@@ -77,7 +85,7 @@ class MotionPlanning(Drone):
     def velocity_callback(self):     # Can now land on top of a building
         if self.flight_state == States.LANDING:
             if np.abs(self.local_position[2] + self.landing_alt) < 0.1 or \
-               np.linalg.norm(self.local_velocity) < 1.0:
+               np.linalg.norm(self.local_velocity) < 0.3:
                     self.disarming_transition()
 
     def state_callback(self):
@@ -104,8 +112,6 @@ class MotionPlanning(Drone):
         self.flight_state = States.TAKEOFF
         print("takeoff transition")
         self.takeoff(self.target_position[2])
-        self.cmd_position(self.target_position[0], self.target_position[1], self.target_position[2], 
-                          0)
 
     def navigate_to_target(self, dist2Target):
         receding_horizon_target = get_receding_horizon_target(self.grid, 
@@ -118,9 +124,42 @@ class MotionPlanning(Drone):
         self.cmd_position(receding_horizon_target[0], receding_horizon_target[1], 
                           self.target_position[2], 0)
 
+    def replan(self, localStart, localGoal):
+        print('Unforeseen obstruction. Replanning from the last visited waypoint')
+        grid_start = local_position_2_grid_coord(localStart, self.grid, self.north_offset, self.east_offset)
+        grid_goal = local_position_2_grid_coord(localGoal, self.grid, self.north_offset, self.east_offset)
+
+        # need 3d coordinates this time
+        grid_start = (grid_start[0], grid_start[1], localStart[2])
+        grid_goal = (grid_goal[0], grid_goal[1], localGoal[2])
+
+        foundPath2Goal, patchPath = createProbabilisticRoadMap(self.grid, grid_start, grid_goal, self.SAFETY_DISTANCE)
+        if not foundPath2Goal:
+            print('**********************')
+            print('Could not find even a probabilistic roadmap. This goal is unreachable!')
+            print('**********************') 
+            self.waypoints = []
+            return False
+
+        patchPath = [[int(p[0]), int(p[1]), int(p[2])] for p in patchPath]
+
+        # insert the grid_start into the graph-based path
+        patchPath.insert(0, list(grid_start))
+        # put the grid goal into the graph-based path
+        patchPath.append(list(grid_goal))
+
+        # TODO: prune path to minimize number of waypoints
+        print("Pruning the path ...")
+        patchPath = prune_path_bresenham(patchPath, self.grid, self.SAFETY_DISTANCE)
+
+        # Convert path to waypoints
+        self.waypoints = [[p[0] + self.north_offset, p[1] + self.east_offset, p[2]] for p in patchPath]
+        return True
+
     def waypoint_transition(self):
         self.flight_state = States.WAYPOINT
         #print("waypoint transition")
+        self.prevTargetPos = self.target_position
         self.target_position = self.waypoints.pop(0)
         print('target position', self.target_position)
         self.cmd_position(self.target_position[0], self.target_position[1], self.target_position[2], 
@@ -182,8 +221,16 @@ class MotionPlanning(Drone):
 def select_grid_start_and_goal(grid, north_offset, east_offset, SAFETY_DISTANCE):
     grid_start = local_position_2_grid_coord((0, 0, 0), grid, north_offset, east_offset)
 
+    # Define a graph for a particular altitude and safety margin around obstacles
+    graph = create_graph(data, grid, north_offset, east_offset, SAFETY_DISTANCE)
+
     plt.imshow(grid, origin='lower', cmap='Greys') 
     plt.plot(grid_start[1], grid_start[0], 'rx')
+
+    for e in graph.edges:
+        p1 = e[0]
+        p2 = e[1]
+        plt.plot([p1[1], p2[1]], [p1[0], p2[0]], 'b-')
 
     plt.xlabel('EAST')
     plt.ylabel('NORTH')
@@ -195,12 +242,13 @@ def select_grid_start_and_goal(grid, north_offset, east_offset, SAFETY_DISTANCE)
     # TODO: convert pts to grid values
     grid_goal = (int(pt_goal[1]), int(pt_goal[0]))
 
-    grid_start_3d = (grid_start[0], grid_start[1], SAFETY_DISTANCE*2)
+    starting_alt = np.int(grid[grid_start[0], grid_start[1]])
+    grid_start_3d = (grid_start[0], grid_start[1], starting_alt+SAFETY_DISTANCE+1)
 
     landing_alt = np.int(grid[grid_goal[0], grid_goal[1]])
-    grid_goal_3d = (grid_goal[0], grid_goal[1], landing_alt+SAFETY_DISTANCE*2)
+    grid_goal_3d = (grid_goal[0], grid_goal[1], landing_alt+SAFETY_DISTANCE+1)
 
-    return grid_start_3d, grid_goal_3d, landing_alt
+    return graph, grid_start_3d, grid_goal_3d, landing_alt
 
 def plan_highlevel_path_using_grid_Astar(grid, north_offset, east_offset, 
                                          SAFETY_DISTANCE,
@@ -256,13 +304,10 @@ def plan_highlevel_path_using_grid_Astar(grid, north_offset, east_offset,
     return waypoints
 
 
-def plan_highlevel_path_using_graph_Astar(data, grid, north_offset, east_offset, 
+def plan_highlevel_path_using_graph_Astar(graph, grid, north_offset, east_offset, 
                                           SAFETY_DISTANCE,
                                           grid_start, grid_goal):
     print("Searching for a path ...")
-        
-    # Define a graph for a particular altitude and safety margin around obstacles
-    graph = create_graph(data, grid, north_offset, east_offset, SAFETY_DISTANCE)
 
     # define graph start and graph goal
     graph_start = closestNode(graph, (grid_start[0], grid_start[1]))
@@ -302,7 +347,7 @@ def plan_highlevel_path_using_graph_Astar(data, grid, north_offset, east_offset,
 
         # TODO: prune path to minimize number of waypoints
         print("Pruning the path ...")
-        path = prune_path(path, grid, SAFETY_DISTANCE)
+        path = prune_path_bresenham(path, grid, SAFETY_DISTANCE)
 
         # Convert path to waypoints
         waypoints = [[p[0] + north_offset, p[1] + east_offset, p[2]] for p in path]
@@ -361,14 +406,14 @@ if __name__ == "__main__":
 
     # select grid start and goal. 
     # goal is a randomly picked lat/lon converted to grid coordinates
-    grid_start_3d, grid_goal_3d, landing_alt = \
+    graph, grid_start_3d, grid_goal_3d, landing_alt = \
         select_grid_start_and_goal(grid, north_offset, east_offset, SAFETY_DISTANCE)
     print('Grid Start and Goal: ', grid_start_3d, grid_goal_3d)
 
     waypoints = []
 
     print('Planning a path using graph Astar')
-    waypoints = plan_highlevel_path_using_graph_Astar(data, grid, north_offset, 
+    waypoints = plan_highlevel_path_using_graph_Astar(graph, grid, north_offset, 
                                                         east_offset, 
                                                         SAFETY_DISTANCE, grid_start_3d, 
                                                         grid_goal_3d)
@@ -403,5 +448,9 @@ if __name__ == "__main__":
         # set initial target altitude for takeoff and landing alt (since we could land on top of a building)
         drone.target_position[2] = SAFETY_DISTANCE
         drone.landing_alt = landing_alt
+
+        # used in deadbanding
+        MAX_DRONE_SPEED = 10
+        drone.deadband_multiplier = SAFETY_DISTANCE/MAX_DRONE_SPEED
 
         drone.start()
